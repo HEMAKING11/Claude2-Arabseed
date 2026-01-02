@@ -46,9 +46,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Headers للطلبات
+# Headers للطلبات - محسّنة لتجاوز الحماية
 DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0"
 }
 
 # تخزين مؤقت للروابط
@@ -78,13 +88,18 @@ def follow_redirect(url, session=None, headers=None, timeout=10):
     if session is None:
         session = requests.Session()
     if headers is None:
-        headers = DEFAULT_HEADERS
+        headers = DEFAULT_HEADERS.copy()
+
+    # إضافة Referer للرابط
+    parsed = urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    headers['Referer'] = base + "/"
 
     try:
-        r = session.get(url, headers=headers, allow_redirects=False, timeout=timeout)
+        r = session.get(url, headers=headers, allow_redirects=False, timeout=timeout, verify=False)
         if 'location' in r.headers:
             return r.headers['location']
-        r2 = session.get(url, headers=headers, allow_redirects=True, timeout=timeout)
+        r2 = session.get(url, headers=headers, allow_redirects=True, timeout=timeout, verify=False)
         return r2.url
     except Exception as e:
         logger.error(f"Error following redirect: {e}")
@@ -92,9 +107,13 @@ def follow_redirect(url, session=None, headers=None, timeout=10):
 
 def get_download_info(server_href, referer):
     session = requests.Session()
-    session.headers.update(DEFAULT_HEADERS)
-    if referer:
-        session.headers.update({"Referer": referer})
+    session.headers.update(DEFAULT_HEADERS.copy())
+    
+    # إضافة المزيد من الـ headers
+    session.headers.update({
+        "Referer": referer,
+        "Origin": extract_base_url(referer)
+    })
 
     try:
         logger.info(f"Processing server link: {server_href}")
@@ -107,7 +126,7 @@ def get_download_info(server_href, referer):
         if '?r=' in redirected:
             r_link = redirected
         else:
-            tmp = session.get(redirected, timeout=12)
+            tmp = session.get(redirected, timeout=12, verify=False)
             m = re.search(r'(https?://[^"\'>\s]+/category/downloadz/\?r=\d+[^"\'>\s]*)', tmp.text)
             if m:
                 r_link = m.group(1)
@@ -122,7 +141,7 @@ def get_download_info(server_href, referer):
             return None
 
         logger.info(f"Found r_link: {r_link}")
-        rpage = session.get(r_link, timeout=12)
+        rpage = session.get(r_link, timeout=12, verify=False)
         rsoup = BeautifulSoup(rpage.text, 'html.parser')
 
         btn_tag = rsoup.find('a', id='btn') or rsoup.select_one('a.downloadbtn')
@@ -154,7 +173,7 @@ def get_download_info(server_href, referer):
             final_asd_url = r_link
             logger.info("Using r_link as final URL")
 
-        final_resp = session.get(final_asd_url, timeout=15)
+        final_resp = session.get(final_asd_url, timeout=15, verify=False)
         if final_resp.status_code != 200:
             logger.warning(f"Final URL returned status {final_resp.status_code}")
             return None
@@ -235,11 +254,20 @@ def process_single_episode(arabseed_url, session):
     try:
         logger.info(f"Processing episode: {arabseed_url}")
         
+        # تحديث الـ headers للـ session
+        session.headers.update(DEFAULT_HEADERS.copy())
+        parsed = urlparse(arabseed_url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        session.headers.update({
+            "Referer": base + "/",
+            "Origin": base
+        })
+        
         if '/l/' in arabseed_url or 'reviewrate.net' in arabseed_url:
             arabseed_url = follow_redirect(arabseed_url, session=session) or arabseed_url
 
         try:
-            resp = session.get(arabseed_url, timeout=12)
+            resp = session.get(arabseed_url, timeout=12, verify=False)
         except Exception as e:
             logger.error(f"Connection error: {e}")
             return None, None
@@ -247,10 +275,25 @@ def process_single_episode(arabseed_url, session):
         if resp.status_code == 404:
             logger.info("Episode returned 404")
             return False, None
+        if resp.status_code == 403:
+            logger.warning("Got 403 Forbidden - trying with different approach")
+            # محاولة مع headers مختلفة
+            time.sleep(2)
+            alt_headers = DEFAULT_HEADERS.copy()
+            alt_headers.update({
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1",
+                "Referer": base + "/"
+            })
+            try:
+                resp = session.get(arabseed_url, timeout=12, headers=alt_headers, verify=False)
+            except Exception:
+                logger.error("Second attempt also failed")
+                return None, None
+                
         if resp.status_code != 200:
             time.sleep(1.2)
             try:
-                resp = session.get(arabseed_url, timeout=12)
+                resp = session.get(arabseed_url, timeout=12, verify=False)
             except Exception:
                 return None, None
             if resp.status_code != 200:
@@ -276,7 +319,7 @@ def process_single_episode(arabseed_url, session):
         logger.info(f"Quality page URL: {quality_page_url}")
 
         try:
-            qresp = session.get(quality_page_url, headers={'Referer': base_url + '/'}, timeout=12)
+            qresp = session.get(quality_page_url, headers={'Referer': base_url + '/'}, timeout=12, verify=False)
             if qresp.status_code != 200:
                 logger.info(f"Quality page returned {qresp.status_code}")
                 return False, None
@@ -377,8 +420,20 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     processing_msg = await update.message.reply_text("⏳ جاري المعالجة... الرجاء الانتظار")
     
+    # تعطيل تحذيرات SSL
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    
     session = requests.Session()
-    session.headers.update(DEFAULT_HEADERS)
+    session.headers.update(DEFAULT_HEADERS.copy())
+    
+    # إضافة referer من نفس الدومين
+    parsed = urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    session.headers.update({
+        "Referer": base + "/",
+        "Origin": base
+    })
     
     # تحقق إذا كان مسلسل
     is_series = 'مسلسل' in unquote(urlparse(url).path) or 'الحلقة' in unquote(urlparse(url).path)
@@ -538,6 +593,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============= تشغيل البوت =============
 def main():
+    # تعطيل تحذيرات SSL
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    
     application = Application.builder().token(BOT_TOKEN).build()
     
     application.add_handler(CommandHandler("start", start))
